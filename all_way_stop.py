@@ -1,6 +1,6 @@
 """
-Simple MPC + FIFO Controller for an All-Way-Stop Intersection
-=============================================================
+Simple MPC + Trajectory-Conflict Controller for an All-Way-Stop Intersection
+============================================================================
 """
 
 import numpy as np
@@ -31,8 +31,103 @@ W_POSITION = 100.0
 W_SPEED = 150.0
 W_ACCEL = 0.20
 W_CROSS = 2000.0
+W_COLLISION = 1.0e5      # penalty for predicted car-to-car overlap
 
 MAXITER = 60
+
+LANE_OFFSET = 3.0         # lane centre offset from the road edge [m]
+CONFLICT_CLEARANCE = 2.5  # paths closer than this are in conflict [m]
+NEARBY_RADIUS = 40.0      # cars within this distance are tracked [m]
+CAR_HALF_WIDTH = 1.0      # used for obstacle clearance [m]
+CAR_LENGTH = 4.5          # [m]
+
+# Each car body is approximated by circles placed from the front bumper
+# (position p) back to the rear bumper.
+CIRCLE_OFFSETS = np.linspace(0.0, CAR_LENGTH, 3)
+COLLISION_DIST = 2.0 * CAR_HALF_WIDTH  # circle centres closer than this = collision [m]
+CAR_BUFFER = 1.0                        # clear space kept between car bodies [m]
+SAFE_DIST = COLLISION_DIST + CAR_BUFFER # circle centres closer than this are penalised [m]
+
+OPPOSITE = {"N": "S", "S": "N", "E": "W", "W": "E"}
+
+
+# =============================================================================
+# GEOMETRY
+# =============================================================================
+
+def position_to_xy(origin, p):
+    """Map a 1-D position along a car's lane to intersection (x, y) coordinates."""
+    if origin == "W": return (p, LANE_OFFSET)
+    if origin == "E": return (INTERSECTION_EXIT - p, INTERSECTION_EXIT - LANE_OFFSET)
+    if origin == "S": return (INTERSECTION_EXIT - LANE_OFFSET, p)
+    if origin == "N": return (LANE_OFFSET, INTERSECTION_EXIT - p)
+    return (0.0, 0.0)
+
+
+def body_points(origin, p):
+    """Circle centres of a car body for one or more positions -> shape (K, C, 2)."""
+    p = np.atleast_1d(p)[:, None] - CIRCLE_OFFSETS[None, :]
+    x, y = position_to_xy(origin, p)
+    return np.stack(np.broadcast_arrays(x, y), axis=-1)
+
+
+def overlap_penalty(points1, points2, safe_dist):
+    """Sum of squared circle overlaps between two bodies over the horizon."""
+    d = np.linalg.norm(points1[:, :, None, :] - points2[:, None, :, :], axis=-1)
+    return np.sum(np.maximum(safe_dist - d, 0.0)**2)
+
+
+def point_segment_distance(pt, a, b):
+    pt, a, b = np.asarray(pt), np.asarray(a), np.asarray(b)
+    ab = b - a
+    t = np.clip(np.dot(pt - a, ab) / np.dot(ab, ab), 0.0, 1.0)
+    return np.linalg.norm(pt - (a + t * ab))
+
+
+def segments_intersect(a, b, c, d):
+    def cross(o, p, q):
+        return (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0])
+    d1, d2 = cross(c, d, a), cross(c, d, b)
+    d3, d4 = cross(a, b, c), cross(a, b, d)
+    return d1 * d2 < 0 and d3 * d4 < 0
+
+
+def segment_distance(a, b, c, d):
+    if segments_intersect(a, b, c, d):
+        return 0.0
+    return min(
+        point_segment_distance(a, c, d),
+        point_segment_distance(b, c, d),
+        point_segment_distance(c, a, b),
+        point_segment_distance(d, a, b),
+    )
+
+
+def path_distance(path1, path2):
+    """Minimum distance between two polyline paths."""
+    return min(
+        segment_distance(path1[i], path1[i + 1], path2[j], path2[j + 1])
+        for i in range(len(path1) - 1)
+        for j in range(len(path2) - 1)
+    )
+
+
+# =============================================================================
+# OBSTACLE
+# =============================================================================
+
+class Obstacle:
+    def __init__(self, x, y, radius):
+        self.x = x
+        self.y = y
+        self.radius = radius
+
+    def blocks(self, path):
+        clearance = self.radius + CAR_HALF_WIDTH
+        return any(
+            point_segment_distance((self.x, self.y), path[i], path[i + 1]) < clearance
+            for i in range(len(path) - 1)
+        )
 
 
 # =============================================================================
@@ -40,9 +135,24 @@ MAXITER = 60
 # =============================================================================
 
 class Car:
-    def __init__(self, car_id, approach, position, speed):
+    def __init__(self, car_id, origin, position, speed, destination=None):
         self.id = car_id
-        self.approach = approach
+
+        # Route information
+        self.origin = origin
+        self.destination = destination or OPPOSITE[origin]
+        if self.destination != OPPOSITE[origin]:
+            raise ValueError("Only straight-through routes are supported by the 1-D model")
+        self.direction = self.destination           # heading of travel
+        self.path = [
+            position_to_xy(origin, STOP_LINE),
+            position_to_xy(origin, INTERSECTION_EXIT),
+        ]
+
+        # Awareness of the surroundings, refreshed every step
+        self.nearby_cars = {}                       # id -> path of nearby cars
+        self.conflicts = []                         # ids of cars whose paths conflict
+        self.obstacles = []                         # obstacles on or near the path
 
         self.p = position
         self.v = speed
@@ -50,12 +160,16 @@ class Car:
         self.state = "APPROACH"
 
         self.stop_time = None
-        self.priority = None
+        self.go_time = None
 
         # Initial guesses for the two optimization problems.
         # Each guess contains N acceleration values.
         self.stop_guess = np.zeros(N)
         self.go_guess = np.zeros(N)
+
+        # Predicted positions over the horizon, shared with other cars so
+        # they can penalise collisions (constant-speed guess to start).
+        self.predicted_p = position + speed * DT * np.arange(N + 1)
 
         # Data saved for plots.
         self.time_history = []
@@ -71,9 +185,8 @@ class Car:
 
 class Controller:
     def __init__(self):
-        self.queue = []
         self.active_cars = []
-        self.next_priority = 1
+        self.collisions = []      # (time, id1, id2) of detected collisions
 
     # -------------------------------------------------------------------------
     # Vehicle prediction model
@@ -97,12 +210,33 @@ class Controller:
     # -------------------------------------------------------------------------
     # Problem 1: STOP
     # -------------------------------------------------------------------------
-    def stop_cost(self, acceleration_sequence, car):
+    def collision_cost(self, car, p, others):
+        """
+        J_collision = W_COLLISION * sum over conflicting cars, horizon steps
+                      and body circles of max(SAFE_DIST - distance, 0)^2
+        """
+
+        if not others:
+            return 0.0
+
+        mine = body_points(car.origin, p[1:])
+        cost = 0.0
+        for other in others:
+            theirs = body_points(other.origin, other.predicted_p[1:])
+            cost += W_COLLISION * overlap_penalty(mine, theirs, SAFE_DIST)
+
+        return cost
+
+    def conflicting_cars(self, car, cars):
+        return [other for other in cars if other.id in car.conflicts]
+
+    def stop_cost(self, acceleration_sequence, car, others):
         """
         J_stop = W_POSITION * p(N)^2
                + W_SPEED    * v(N)^2
                + sum[ W_ACCEL * a(k)^2
                     + W_CROSS * max(p(k+1), 0)^2 ]
+               + J_collision
         """
 
         p, v = self.predict(car.p, car.v, acceleration_sequence)
@@ -114,15 +248,17 @@ class Controller:
             cost += W_ACCEL * acceleration_sequence[k]**2
             cost += W_CROSS * max(p[k + 1], 0.0)**2
 
+        cost += self.collision_cost(car, p, others)
+
         return cost
 
-    def solve_stop_problem(self, car):
+    def solve_stop_problem(self, car, cars):
         """Solve the STOP problem and return the first optimal acceleration."""
 
         result = minimize(
             self.stop_cost,
             car.stop_guess,
-            args=(car,),
+            args=(car, self.conflicting_cars(car, cars)),
             method="BFGS",
             options={"maxiter": MAXITER, "disp": False},
         )
@@ -136,13 +272,14 @@ class Controller:
     # -------------------------------------------------------------------------
     # Problem 2: GO
     # -------------------------------------------------------------------------
-    def go_cost(self, acceleration_sequence, car):
+    def go_cost(self, acceleration_sequence, car, others):
         """
         J_go = sum[ W_SPEED * (v(k+1) - V_DES)^2
                   + W_ACCEL * a(k)^2 ]
+             + J_collision
         """
 
-        _, v = self.predict(car.p, car.v, acceleration_sequence)
+        p, v = self.predict(car.p, car.v, acceleration_sequence)
 
         cost = 0.0
 
@@ -150,15 +287,17 @@ class Controller:
             cost += W_SPEED * (v[k + 1] - V_DES)**2
             cost += W_ACCEL * acceleration_sequence[k]**2
 
+        cost += self.collision_cost(car, p, others)
+
         return cost
 
-    def solve_go_problem(self, car):
+    def solve_go_problem(self, car, cars):
         """Solve the GO problem and return the first optimal acceleration."""
 
         result = minimize(
             self.go_cost,
             car.go_guess,
-            args=(car,),
+            args=(car, self.conflicting_cars(car, cars)),
             method="BFGS",
             options={"maxiter": MAXITER, "disp": False},
         )
@@ -170,63 +309,91 @@ class Controller:
         return optimal_sequence[0]
 
     # -------------------------------------------------------------------------
-    # FIFO logic
+    # Trajectory-conflict logic
     # -------------------------------------------------------------------------
-    def register_stopped_car(self, car, time):
-        """Add a newly stopped car to the FIFO queue."""
+    def update_awareness(self, cars, obstacles):
+        """Refresh each car's nearby cars, trajectory conflicts and obstacles."""
 
-        if car.priority is not None:
-            return
+        live = [car for car in cars if car.state != "DONE"]
+
+        for car in live:
+            here = np.array(position_to_xy(car.origin, car.p))
+
+            car.nearby_cars = {}
+            car.conflicts = []
+            for other in live:
+                if other.id == car.id:
+                    continue
+                there = np.array(position_to_xy(other.origin, other.p))
+                if np.linalg.norm(here - there) > NEARBY_RADIUS:
+                    continue
+
+                car.nearby_cars[other.id] = other.path
+                if path_distance(car.path, other.path) < CONFLICT_CLEARANCE:
+                    car.conflicts.append(other.id)
+
+            car.obstacles = [obs for obs in obstacles if obs.blocks(car.path)]
+
+    def register_stopped_car(self, car, time):
+        """Mark a car that has come to rest at the stop line as waiting."""
 
         car.stop_time = time
-        car.priority = self.next_priority
-        self.next_priority += 1
-
-        self.queue.append(car.id)
         car.state = "WAIT"
-    ##Helper to determine if two approaches do not conflict
-    def can_go_together(self, dir1, dir2):
-        return (dir1, dir2) in [("N", "S"), ("S", "N"), ("E", "W"), ("W", "E")]
 
-    #Added logic for checking if second car in queue can also go
-    def release_next_car(self, cars):
-        """If the intersection is free, allow the first car in the queue to go."""
-
-        if len(self.active_cars) > 0:
-            return
-
-        if len(self.queue) == 0:
-            return
-
-        first_id = self.queue.pop(0)
-        first_approach = ""
+    def release_cars(self, cars, time):
+        """
+        Let a waiting car go only when the constraint does not apply:
+        its path is not blocked by an obstacle and it does not conflict
+        with any car that is already crossing.
+        """
 
         for car in cars:
-            if car.id == first_id:
-                car.state = "GO"
-                self.active_cars.append(car.id)
-                first_approach = car.approach
-                break
+            if car.state != "WAIT":
+                continue
 
-        if len(self.queue) > 0:
-            second_id = self.queue[0]
-            second_approach = ""
+            if car.obstacles:
+                continue
 
-            for car in cars:
-                if car.id == second_id:
-                    second_approach = car.approach
-                    break
+            if any(other_id in self.active_cars for other_id in car.conflicts):
+                continue
 
-            if self.can_go_together(first_approach, second_approach):
-                self.queue.pop(0)  # Remove the second car from the queue
-                for car in cars:
-                    if car.id == second_id:
-                        car.state = "GO"
-                        self.active_cars.append(car.id)
-                        break
+            car.state = "GO"
+            car.go_time = time
+            self.active_cars.append(car.id)
+
+    # -------------------------------------------------------------------------
+    # Collision handling
+    # -------------------------------------------------------------------------
+    def update_prediction(self, car):
+        """Shift the car's latest plan forward one step for the other cars to use."""
+
+        if car.state == "WAIT":
+            car.predicted_p = np.full(N + 1, STOP_LINE)
+            return
+
+        plan = car.go_guess if car.state == "GO" else car.stop_guess
+        shifted = np.append(plan[1:], plan[-1])
+        car.predicted_p, _ = self.predict(car.p, car.v, shifted)
+
+    def detect_collisions(self, cars, time):
+        """Record any pair of cars whose bodies actually overlap."""
+
+        live = [car for car in cars if car.state != "DONE"]
+        for i, car in enumerate(live):
+            for other in live[i + 1:]:
+                d = np.linalg.norm(
+                    body_points(car.origin, car.p)[0][:, None, :]
+                    - body_points(other.origin, other.p)[0][None, :, :],
+                    axis=-1,
+                )
+                if np.min(d) < COLLISION_DIST:
+                    self.collisions.append((time, car.id, other.id))
 
     def check_intersection(self, cars):
-        """Free the intersection after the active car reaches the exit point."""
+        """
+        Free the intersection once the active car's rear bumper is past the
+        exit point by at least CAR_BUFFER.
+        """
 
         if len(self.active_cars) == 0:
             return
@@ -237,7 +404,7 @@ class Controller:
             
             for car in cars:
                 if car.id == current_id:
-                    if car.p >= INTERSECTION_EXIT:
+                    if car.p - CAR_LENGTH >= INTERSECTION_EXIT + CAR_BUFFER:
                         self.active_cars.pop(i)
                     break
 
@@ -259,9 +426,10 @@ def create_cars():
 # 5. SIMULATION
 # =============================================================================
 
-def run_simulation():
+def run_simulation(obstacles=None):
     cars = create_cars()
     controller = Controller()
+    obstacles = obstacles or []
 
     times = np.arange(0.0, SIM_TIME + DT, DT)
 
@@ -270,8 +438,6 @@ def run_simulation():
         # ---------------------------------------------------------------------
         # A. Check whether APPROACH cars have stopped.
         # ---------------------------------------------------------------------
-        # Cars are checked in ID order. If two stop at exactly the same time,
-        # the smaller ID receives priority first.
         for car in cars:
             if car.state != "APPROACH":
                 continue
@@ -285,9 +451,11 @@ def run_simulation():
                 controller.register_stopped_car(car, time)
 
         # ---------------------------------------------------------------------
-        # B. If possible, release the first car in the FIFO queue.
+        # B. Update trajectory conflicts/obstacles and release any waiting
+        #    car whose path is clear.
         # ---------------------------------------------------------------------
-        controller.release_next_car(cars)
+        controller.update_awareness(cars, obstacles)
+        controller.release_cars(cars, time)
 
         # ---------------------------------------------------------------------
         # C. Compute one acceleration to apply to each car.
@@ -296,13 +464,13 @@ def run_simulation():
 
         for car in cars:
             if car.state == "APPROACH":
-                accelerations[car.id] = controller.solve_stop_problem(car)
+                accelerations[car.id] = controller.solve_stop_problem(car, cars)
 
             elif car.state == "WAIT":
                 accelerations[car.id] = 0.0
 
             elif car.state == "GO":
-                accelerations[car.id] = controller.solve_go_problem(car)
+                accelerations[car.id] = controller.solve_go_problem(car, cars)
 
             else:  # DONE
                 accelerations[car.id] = 0.0
@@ -330,6 +498,10 @@ def run_simulation():
                 car.p = car.p + car.v * DT + 0.5 * a * DT**2
                 car.v = car.v + a * DT
 
+            controller.update_prediction(car)
+
+        controller.detect_collisions(cars, time)
+
         # ---------------------------------------------------------------------
         # E. Check whether the active car has cleared the intersection.
         # ---------------------------------------------------------------------
@@ -345,25 +517,35 @@ def run_simulation():
         if all(car.state == "DONE" for car in cars):
             break
 
-    return cars
+    return cars, controller
 
 
 # =============================================================================
 # 6. RESULTS
 # =============================================================================
 
-def print_summary(cars):
-    print("\nFIFO crossing order")
-    print("-------------------")
+def print_summary(cars, controller):
+    print("\nCrossing summary")
+    print("----------------")
 
-    ordered_cars = sorted(cars, key=lambda car: car.priority)
+    ordered_cars = sorted(
+        cars, key=lambda car: car.go_time if car.go_time is not None else float("inf")
+    )
 
     for car in ordered_cars:
+        stop = f"{car.stop_time:.1f} s" if car.stop_time is not None else "-"
+        go = f"{car.go_time:.1f} s" if car.go_time is not None else "never"
+        conflicts = ", ".join(f"V{i}" for i in car.conflicts) or "none"
         print(
-            f"Priority {car.priority}: "
-            f"Vehicle {car.id} ({car.approach}), "
-            f"stop time = {car.stop_time:.1f} s"
+            f"Vehicle {car.id} ({car.origin} -> {car.destination}): "
+            f"stop time = {stop}, go time = {go}, conflicts with {conflicts}"
         )
+
+    pairs = sorted({(a, b) for _, a, b in controller.collisions})
+    if pairs:
+        print(f"Collisions: {', '.join(f'V{a}-V{b}' for a, b in pairs)}")
+    else:
+        print("Collisions: none")
 
 
 def plot_results(cars):
@@ -374,7 +556,7 @@ def plot_results(cars):
         plt.plot(
             car.time_history,
             car.position_history,
-            label=f"Vehicle {car.id} ({car.approach})",
+            label=f"Vehicle {car.id} ({car.origin})",
         )
 
     plt.axhline(STOP_LINE, linestyle="--", linewidth=1, label="Stop line")
@@ -401,7 +583,7 @@ def plot_results(cars):
         plt.plot(
             car.time_history,
             car.speed_history,
-            label=f"Vehicle {car.id} ({car.approach})",
+            label=f"Vehicle {car.id} ({car.origin})",
         )
 
     plt.axhline(V_DES, linestyle="--", linewidth=1, label="Desired speed")
@@ -453,13 +635,6 @@ def animate_results(cars):
         "GO": "#2ecc71"         
     }
 
-    def get_xy(approach, p):
-        if approach == "W": return (p, 3)         
-        if approach == "E": return (12 - p, 9)    
-        if approach == "S": return (9, p)         
-        if approach == "N": return (3, 12 - p)    
-        return (0, 0)
-
     car_length = 4.5
     car_width = 2.0
     car_patches = {}
@@ -488,7 +663,7 @@ def animate_results(cars):
         
         for car in sorted(cars, key=lambda c: c.id):
             vid = car.id
-            approach = car.approach
+            approach = car.origin
             
             if frame_idx < len(car.position_history):
                 p = car.position_history[frame_idx]
@@ -499,7 +674,7 @@ def animate_results(cars):
                 p = car.position_history[-1] if car.position_history else 0
                 v = 0.0
                 
-            cx, cy = get_xy(approach, p)
+            cx, cy = position_to_xy(approach, p)
             rect = car_patches[vid]
             
             if state != "DONE":
@@ -546,7 +721,7 @@ def animate_results(cars):
 # =============================================================================
 
 if __name__ == "__main__":
-    cars = run_simulation()
-    print_summary(cars)
+    cars, controller = run_simulation()
+    print_summary(cars, controller)
     plot_results(cars)
     animate_results(cars)
