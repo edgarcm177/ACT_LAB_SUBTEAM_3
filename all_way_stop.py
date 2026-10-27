@@ -1,552 +1,235 @@
+"""Experimental 2D MPC comparing ellipse and superellipse collision potentials.
+Run python all_way_stop.py [--no-animation]. See EXPERIMENT.md.
 """
-Simple MPC + FIFO Controller for an All-Way-Stop Intersection
-=============================================================
-"""
-
+import argparse
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.animation as animation
-import matplotlib.patches as patches 
+from matplotlib import animation, patches
 from scipy.optimize import minimize
 
+DT, SIM_TIME, N, V_DES = 0.2, 35.0, 20, 8.0
+W_SPEED, W_ACCEL = 8.0, 0.2
+W_LANE, W_LATERAL_SPEED, W_ROAD, W_COLLISION = 12.0, 10.0, 5000.0, 2000.0
+SAFETY_LONG, SAFETY_LAT, SHARPNESS = 7.0, 3.5, 5.0
+SHAPE_POWER = 4  # 2: ellipse baseline; 4: rounded rectangle experiment
+MAX_ACCEL, MAX_BRAKE, MAX_LATERAL_ACCEL = 2.5, 4.0, 1.5
+MAX_SPEED, MAXITER, LANE_DEVIATION = 10.0, 60, 1.8
 
-# =============================================================================
-# 1. PARAMETERS
-# =============================================================================
-
-DT = 0.20                 # sampling time [s]
-SIM_TIME = 35.0           # maximum simulation time [s]
-N = 20                    # prediction horizon
-V_DES = 8.0               # desired speed in GO [m/s]
-
-STOP_LINE = 0.0           # stop line position [m]
-INTERSECTION_EXIT = 12.0  # intersection is clear after this point [m]
-DELETE_POINT = 25.0       # remove vehicle after this point [m]
-
-STOP_POS_TOL = 0.50       # stopping position tolerance [m]
-STOP_SPEED_TOL = 0.20     # stopping speed tolerance [m/s]
-
-# Objective-function weights from the report
-W_POSITION = 100.0
-W_SPEED = 150.0
-W_ACCEL = 0.20
-W_CROSS = 2000.0
-
-MAXITER = 60
-
-
-# =============================================================================
-# 2. CAR
-# =============================================================================
 
 class Car:
     def __init__(self, car_id, approach, position, speed):
-        self.id = car_id
-        self.approach = approach
+        self.id, self.approach = car_id, approach
+        # Centers when the front bumper reaches the stop line.
+        origin, forward = {
+            'W': ((-2.25, 3.), (1., 0.)), 'E': ((14.25, 9.), (-1., 0.)),
+            'S': ((9., -2.25), (0., 1.)), 'N': ((3., 14.25), (0., -1.))
+        }[approach]
+        self.origin, self.forward = np.array(origin), np.array(forward)
+        self.left = np.array([-self.forward[1], self.forward[0]])
+        self.xy = self.origin + position * self.forward
+        self.velocity = speed * self.forward
+        self.guess = np.zeros((N, 2))
+        self.state, self.stop_time = 'APPROACH', None
+        self.time_history, self.xy_history = [], []
+        self.velocity_history, self.acceleration_history = [], []
 
-        self.p = position
-        self.v = speed
+    @property
+    def p(self):
+        return float((self.xy - self.origin) @ self.forward)
 
-        self.state = "APPROACH"
-
-        self.stop_time = None
-        self.priority = None
-
-        # Initial guesses for the two optimization problems.
-        # Each guess contains N acceleration values.
-        self.stop_guess = np.zeros(N)
-        self.go_guess = np.zeros(N)
-
-        # Data saved for plots.
-        self.time_history = []
-        self.position_history = []
-        self.speed_history = []
-        self.acceleration_history = []
-        self.state_history = []
-
-
-# =============================================================================
-# 3. CONTROLLER
-# =============================================================================
 
 class Controller:
     def __init__(self):
-        self.queue = []
-        self.active_cars = []
-        self.next_priority = 1
+        self.failed_solves = 0
 
-    # -------------------------------------------------------------------------
-    # Vehicle prediction model
-    # -------------------------------------------------------------------------
-    def predict(self, p0, v0, acceleration_sequence):
+    def predict(self, x0, y0, vx0, vy0, acceleration_sequence):
+        """World-coordinate dynamics, returning x, y, vx, vy trajectories."""
+        a = np.asarray(acceleration_sequence).reshape(N, 2)
+        v = np.vstack(([vx0, vy0], [vx0, vy0] + DT * np.cumsum(a, axis=0)))
+        xy = np.vstack(([x0, y0], [x0, y0] + np.cumsum(
+            v[:-1] * DT + 0.5 * a * DT**2, axis=0)))
+        return xy[:, 0], xy[:, 1], v[:, 0], v[:, 1]
 
-        p = np.zeros(N + 1)
-        v = np.zeros(N + 1)
+    def trajectory(self, car, local_accel):
+        world = local_accel[:, :1] * car.forward + local_accel[:, 1:] * car.left
+        x, y, vx, vy = self.predict(*car.xy, *car.velocity, world)
+        return np.column_stack((x, y)), np.column_stack((vx, vy))
 
-        p[0] = p0
-        v[0] = v0
+    @staticmethod
+    def collision_potential(relative_xy, obstacle):
+        """q=1 is a superellipse; exponent 2 recovers the ellipse baseline."""
+        q = np.abs((relative_xy @ obstacle.forward) / SAFETY_LONG)**SHAPE_POWER
+        q += np.abs((relative_xy @ obstacle.left) / SAFETY_LAT)**SHAPE_POWER
+        return (np.logaddexp(0., SHARPNESS * (1. - q)) / SHARPNESS)**2
 
-        for k in range(N):
-            a = acceleration_sequence[k]
+    def objective(self, flat, car, obstacles):
+        a = flat.reshape(N, 2)
+        xy, velocity = self.trajectory(car, a)
+        p = (xy[1:] - car.origin) @ car.forward
+        lateral = (xy[1:] - car.origin) @ car.left
+        vf, vl = velocity[1:] @ car.forward, velocity[1:] @ car.left
+        if car.state == 'APPROACH':
+            cost = 100. * p[-1]**2 + 150. * vf[-1]**2
+            cost += 2000. * np.sum(np.maximum(p, 0.)**2)
+        else:
+            cost = W_SPEED * np.sum((vf - V_DES)**2)
+        cost += W_ACCEL * np.sum(a**2)
+        cost += W_LATERAL_SPEED * np.sum(vl**2) + W_LANE * np.sum(lateral**2)
+        cost += W_ROAD * np.sum(np.maximum(np.abs(lateral) - LANE_DEVIATION, 0.)**2)
+        for other, prediction in obstacles:
+            cost += W_COLLISION * np.sum(self.collision_potential(xy[1:] - prediction[1:], other))
+        return float(cost)
 
-            p[k + 1] = p[k] + v[k] * DT + 0.5 * a * DT**2
-            v[k + 1] = v[k] + a * DT
+    def solve(self, car, obstacles):
+        initial_speed = car.velocity @ car.forward
 
-        return p, v
+        def constraints(flat):
+            vf = initial_speed + DT * np.cumsum(flat.reshape(N, 2)[:, 0])
+            return np.concatenate((vf, MAX_SPEED - vf))
 
-    # -------------------------------------------------------------------------
-    # Problem 1: STOP
-    # -------------------------------------------------------------------------
-    def stop_cost(self, acceleration_sequence, car):
-        """
-        J_stop = W_POSITION * p(N)^2
-               + W_SPEED    * v(N)^2
-               + sum[ W_ACCEL * a(k)^2
-                    + W_CROSS * max(p(k+1), 0)^2 ]
-        """
+        result = minimize(self.objective, car.guess.ravel(), args=(car, obstacles),
+                          method='SLSQP', bounds=[(-MAX_BRAKE, MAX_ACCEL),
+                          (-MAX_LATERAL_ACCEL, MAX_LATERAL_ACCEL)] * N,
+                          constraints={'type': 'ineq', 'fun': constraints},
+                          options={'maxiter': MAXITER, 'ftol': 1e-4})
+        if (not result.success or not np.all(np.isfinite(result.x))
+                or np.min(constraints(result.x)) < -1e-5):
+            self.failed_solves += 1
+            plan, speed = np.zeros((N, 2)), initial_speed
+            for k in range(N):
+                plan[k, 0] = -min(MAX_BRAKE, max(speed, 0.) / DT)
+                speed += DT * plan[k, 0]
+        else:
+            plan = result.x.reshape(N, 2)
+        car.guess = np.vstack((plan[1:], plan[-1:]))
+        return plan[0].copy()
 
-        p, v = self.predict(car.p, car.v, acceleration_sequence)
-
-        cost = W_POSITION * p[N]**2
-        cost += W_SPEED * v[N]**2
-
-        for k in range(N):
-            cost += W_ACCEL * acceleration_sequence[k]**2
-            cost += W_CROSS * max(p[k + 1], 0.0)**2
-
-        return cost
-
-    def solve_stop_problem(self, car):
-        """Solve the STOP problem and return the first optimal acceleration."""
-
-        result = minimize(
-            self.stop_cost,
-            car.stop_guess,
-            args=(car,),
-            method="BFGS",
-            options={"maxiter": MAXITER, "disp": False},
-        )
-
-        optimal_sequence = result.x
-        car.stop_guess = optimal_sequence
-
-        # MPC: apply only the first input.
-        return optimal_sequence[0]
-
-    # -------------------------------------------------------------------------
-    # Problem 2: GO
-    # -------------------------------------------------------------------------
-    def go_cost(self, acceleration_sequence, car):
-        """
-        J_go = sum[ W_SPEED * (v(k+1) - V_DES)^2
-                  + W_ACCEL * a(k)^2 ]
-        """
-
-        _, v = self.predict(car.p, car.v, acceleration_sequence)
-
-        cost = 0.0
-
-        for k in range(N):
-            cost += W_SPEED * (v[k + 1] - V_DES)**2
-            cost += W_ACCEL * acceleration_sequence[k]**2
-
-        return cost
-
-    def solve_go_problem(self, car):
-        """Solve the GO problem and return the first optimal acceleration."""
-
-        result = minimize(
-            self.go_cost,
-            car.go_guess,
-            args=(car,),
-            method="BFGS",
-            options={"maxiter": MAXITER, "disp": False},
-        )
-
-        optimal_sequence = result.x
-        car.go_guess = optimal_sequence
-
-        # MPC: apply only the first input.
-        return optimal_sequence[0]
-
-    # -------------------------------------------------------------------------
-    # FIFO logic
-    # -------------------------------------------------------------------------
-    def register_stopped_car(self, car, time):
-        """Add a newly stopped car to the FIFO queue."""
-
-        if car.priority is not None:
-            return
-
-        car.stop_time = time
-        car.priority = self.next_priority
-        self.next_priority += 1
-
-        self.queue.append(car.id)
-        car.state = "WAIT"
-    ##Helper to determine if two approaches do not conflict
-    def can_go_together(self, dir1, dir2):
-        return (dir1, dir2) in [("N", "S"), ("S", "N"), ("E", "W"), ("W", "E")]
-
-    #Added logic for checking if second car in queue can also go
-    def release_next_car(self, cars):
-        """If the intersection is free, allow the first car in the queue to go."""
-
-        if len(self.active_cars) > 0:
-            return
-
-        if len(self.queue) == 0:
-            return
-
-        first_id = self.queue.pop(0)
-        first_approach = ""
-
-        for car in cars:
-            if car.id == first_id:
-                car.state = "GO"
-                self.active_cars.append(car.id)
-                first_approach = car.approach
-                break
-
-        if len(self.queue) > 0:
-            second_id = self.queue[0]
-            second_approach = ""
-
-            for car in cars:
-                if car.id == second_id:
-                    second_approach = car.approach
-                    break
-
-            if self.can_go_together(first_approach, second_approach):
-                self.queue.pop(0)  # Remove the second car from the queue
-                for car in cars:
-                    if car.id == second_id:
-                        car.state = "GO"
-                        self.active_cars.append(car.id)
-                        break
-
-    def check_intersection(self, cars):
-        """Free the intersection after the active car reaches the exit point."""
-
-        if len(self.active_cars) == 0:
-            return
-
-        # Iterate backwards to safely remove items from the list during the loop
-        for i in range(len(self.active_cars) - 1, -1, -1):
-            current_id = self.active_cars[i]
-            
-            for car in cars:
-                if car.id == current_id:
-                    if car.p >= INTERSECTION_EXIT:
-                        self.active_cars.pop(i)
-                    break
-
-
-# =============================================================================
-# 4. DEMONSTRATION VEHICLES
-# =============================================================================
 
 def create_cars():
-    return [
-        Car(1, "W", -24.0, 7.0),
-        Car(2, "E", -30.0, 7.5),
-        Car(3, "S", -36.0, 8.0),
-        Car(4, "N", -42.0, 8.0),
-    ]
+    return [Car(1, 'W', -24., 7.), Car(2, 'E', -30., 7.5),
+            Car(3, 'S', -36., 8.), Car(4, 'N', -42., 8.)]
 
-
-# =============================================================================
-# 5. SIMULATION
-# =============================================================================
 
 def run_simulation():
-    cars = create_cars()
-    controller = Controller()
-
-    times = np.arange(0.0, SIM_TIME + DT, DT)
-
-    for time in times:
-
-        # ---------------------------------------------------------------------
-        # A. Check whether APPROACH cars have stopped.
-        # ---------------------------------------------------------------------
-        # Cars are checked in ID order. If two stop at exactly the same time,
-        # the smaller ID receives priority first.
-        for car in cars:
-            if car.state != "APPROACH":
-                continue
-
-            close_to_stop_line = abs(car.p - STOP_LINE) <= STOP_POS_TOL
-            almost_stopped = car.v <= STOP_SPEED_TOL
-
-            if close_to_stop_line and almost_stopped:
-                car.p = STOP_LINE
-                car.v = 0.0
-                controller.register_stopped_car(car, time)
-
-        # ---------------------------------------------------------------------
-        # B. If possible, release the first car in the FIFO queue.
-        # ---------------------------------------------------------------------
-        controller.release_next_car(cars)
-
-        # ---------------------------------------------------------------------
-        # C. Compute one acceleration to apply to each car.
-        # ---------------------------------------------------------------------
-        accelerations = {}
-
-        for car in cars:
-            if car.state == "APPROACH":
-                accelerations[car.id] = controller.solve_stop_problem(car)
-
-            elif car.state == "WAIT":
-                accelerations[car.id] = 0.0
-
-            elif car.state == "GO":
-                accelerations[car.id] = controller.solve_go_problem(car)
-
-            else:  # DONE
-                accelerations[car.id] = 0.0
-
-        # ---------------------------------------------------------------------
-        # D. Save the current state and move each car one simulation step.
-        # ---------------------------------------------------------------------
-        for car in cars:
-            if car.state == "DONE":
-                continue
-
-            a = accelerations[car.id]
-
+    cars, controller = create_cars(), Controller()
+    minimum_gap = float('inf')
+    for time in np.arange(0., SIM_TIME + DT, DT):
+        active = [c for c in cars if c.state != 'DONE']
+        for car in active:
+            if (car.state == 'APPROACH' and abs(car.p) <= 0.5
+                    and np.linalg.norm(car.velocity) <= 0.2):
+                car.state, car.stop_time = 'GO', time
+        # Freeze the previous shifted plans before solving any new controls.
+        predictions = {c.id: controller.trajectory(c, c.guess)[0] for c in active}
+        actions = {c.id: controller.solve(c, [(o, predictions[o.id]) for o in active
+                                             if o.id != c.id]) for c in active}
+        for car in active:
+            a = actions[car.id]
             car.time_history.append(time)
-            car.position_history.append(car.p)
-            car.speed_history.append(car.v)
-            car.acceleration_history.append(a)
-            car.state_history.append(car.state)
-
-            if car.state == "WAIT":
-                car.p = STOP_LINE
-                car.v = 0.0
-
-            else:
-                car.p = car.p + car.v * DT + 0.5 * a * DT**2
-                car.v = car.v + a * DT
-
-        # ---------------------------------------------------------------------
-        # E. Check whether the active car has cleared the intersection.
-        # ---------------------------------------------------------------------
-        controller.check_intersection(cars)
-
-        # ---------------------------------------------------------------------
-        # F. Remove cars after the downstream deletion point.
-        # ---------------------------------------------------------------------
-        for car in cars:
-            if car.state == "GO" and car.p >= DELETE_POINT:
-                car.state = "DONE"
-
-        if all(car.state == "DONE" for car in cars):
+            car.xy_history.append(car.xy.copy())
+            car.velocity_history.append(car.velocity.copy())
+            car.acceleration_history.append(a.copy())
+            world_a = a[0] * car.forward + a[1] * car.left
+            car.xy += car.velocity * DT + 0.5 * world_a * DT**2
+            car.velocity += world_a * DT
+        for i, car in enumerate(active):
+            size = np.abs(car.forward) * 4.5 + np.abs(car.left) * 2.
+            for other in active[i + 1:]:
+                other_size = np.abs(other.forward) * 4.5 + np.abs(other.left) * 2.
+                gap = np.abs(car.xy - other.xy) - (size + other_size) / 2
+                minimum_gap = min(minimum_gap, float(np.max(gap)))
+        for car in active:
+            if car.state == 'GO' and car.p >= 25.:
+                car.state = 'DONE'
+        if all(c.state == 'DONE' for c in cars):
             break
-
+    print(f'Solver fallbacks: {controller.failed_solves}')
+    print(f'Minimum signed rectangle separation at sampled steps: {minimum_gap:.2f} m')
+    if minimum_gap < 0:
+        print('WARNING: vehicle bodies overlapped at a sampled step.')
+    for car in cars:
+        print(f'Vehicle {car.id} ({car.approach}): stop={car.stop_time}, final={car.state}')
     return cars
 
 
-# =============================================================================
-# 6. RESULTS
-# =============================================================================
-
-def print_summary(cars):
-    print("\nFIFO crossing order")
-    print("-------------------")
-
-    ordered_cars = sorted(cars, key=lambda car: car.priority)
-
-    for car in ordered_cars:
-        print(
-            f"Priority {car.priority}: "
-            f"Vehicle {car.id} ({car.approach}), "
-            f"stop time = {car.stop_time:.1f} s"
-        )
-
-
 def plot_results(cars):
-    # Position plot
-    plt.figure(figsize=(9, 5))
-
+    for filename, ylabel, values in [
+        ('position_vs_time.png', 'Longitudinal position [m]',
+         lambda c: (np.array(c.xy_history) - c.origin) @ c.forward),
+        ('speed_vs_time.png', 'Speed [m/s]', lambda c: np.linalg.norm(c.velocity_history, axis=1)),
+    ]:
+        fig, ax = plt.subplots(figsize=(9, 5))
+        for car in cars:
+            ax.plot(car.time_history, values(car), label=f'V{car.id} ({car.approach})')
+        ax.set(xlabel='Time [s]', ylabel=ylabel)
+        ax.grid(True)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(filename, dpi=160)
+        plt.close(fig)
+    fig, ax = plt.subplots(figsize=(8, 8))
     for car in cars:
-        plt.plot(
-            car.time_history,
-            car.position_history,
-            label=f"Vehicle {car.id} ({car.approach})",
-        )
-
-    plt.axhline(STOP_LINE, linestyle="--", linewidth=1, label="Stop line")
-    plt.axhline(
-        INTERSECTION_EXIT,
-        linestyle=":",
-        linewidth=1,
-        label="Intersection exit",
-    )
-
-    plt.xlabel("Time [s]")
-    plt.ylabel("Position [m]")
-    plt.title("Vehicle Position")
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("position_vs_time.png", dpi=200)
-    plt.close()
-
-    # Speed plot
-    plt.figure(figsize=(9, 5))
-
-    for car in cars:
-        plt.plot(
-            car.time_history,
-            car.speed_history,
-            label=f"Vehicle {car.id} ({car.approach})",
-        )
-
-    plt.axhline(V_DES, linestyle="--", linewidth=1, label="Desired speed")
-
-    plt.xlabel("Time [s]")
-    plt.ylabel("Speed [m/s]")
-    plt.title("Vehicle Speed")
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("speed_vs_time.png", dpi=200)
-    plt.close()
-
-
-
-#Animation Function
-def animate_results(cars):
-    max_frames = max(len(car.time_history) for car in cars)
-    
-    fig, ax = plt.subplots(figsize=(12, 12), dpi=120)
-    ax.set_xlim(-45, 45)
-    ax.set_ylim(-45, 45)
+        xy = np.array(car.xy_history)
+        ax.plot(xy[:, 0], xy[:, 1], label=f'V{car.id} ({car.approach})')
+    ax.set(xlabel='x [m]', ylabel='y [m]', title='Actual 2D trajectories')
     ax.set_aspect('equal')
-    ax.set_facecolor('#2e2e2e')
-    ax.set_title("All-Way Stop MPC Controller", color='white', pad=20, fontsize=16)
+    ax.grid(True)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig('trajectories_2d.png', dpi=160)
+    plt.close(fig)
 
-    road_width = 12
-    intersection = patches.Rectangle((0, 0), road_width, road_width, color='#555555', zorder=1)
-    ax.add_patch(intersection)
 
-    ax.add_patch(patches.Rectangle((-50, 0), 50, road_width, color='#444444', zorder=0))  
-    ax.add_patch(patches.Rectangle((12, 0), 50, road_width, color='#444444', zorder=0))   
-    ax.add_patch(patches.Rectangle((0, -50), road_width, 50, color='#444444', zorder=0))  
-    ax.add_patch(patches.Rectangle((0, 12), road_width, 50, color='#444444', zorder=0))   
-
-    ax.plot([-50, 0], [6, 6], color='#e6c800', linestyle='--', zorder=2)
-    ax.plot([12, 50], [6, 6], color='#e6c800', linestyle='--', zorder=2)
-    ax.plot([6, 6], [-50, 0], color='#e6c800', linestyle='--', zorder=2)
-    ax.plot([6, 6], [12, 50], color='#e6c800', linestyle='--', zorder=2)
-
-    ax.plot([0, 0], [0, 6], color='white', linewidth=4, zorder=2)       
-    ax.plot([12, 12], [6, 12], color='white', linewidth=4, zorder=2)    
-    ax.plot([6, 12], [0, 0], color='white', linewidth=4, zorder=2)      
-    ax.plot([0, 6], [12, 12], color='white', linewidth=4, zorder=2)     
-
-    STATE_COLORS = {
-        "APPROACH": "#f39c12",  
-        "WAIT": "#e74c3c",      
-        "GO": "#2ecc71"         
-    }
-
-    def get_xy(approach, p):
-        if approach == "W": return (p, 3)         
-        if approach == "E": return (12 - p, 9)    
-        if approach == "S": return (9, p)         
-        if approach == "N": return (3, 12 - p)    
-        return (0, 0)
-
-    car_length = 4.5
-    car_width = 2.0
-    car_patches = {}
-    car_texts = {}
-
+def animate_results(cars):
+    fig, ax = plt.subplots(figsize=(9, 9))
+    ax.set(xlim=(-45, 45), ylim=(-45, 45), xlabel='x [m]', ylabel='y [m]')
+    ax.set_aspect('equal')
+    ax.set_facecolor('#303030')
+    ax.add_patch(patches.Rectangle((-50, 0), 100, 12, color='#666666'))
+    ax.add_patch(patches.Rectangle((0, -50), 12, 100, color='#666666'))
+    ax.plot([-50, 50], [6, 6], 'y--', alpha=0.4)
+    ax.plot([6, 6], [-50, 50], 'y--', alpha=0.4)
+    bodies, labels, contours = [], [], []
+    theta = np.linspace(0., 2 * np.pi, 161)
+    longitudinal = SAFETY_LONG * np.sign(np.cos(theta)) * np.abs(np.cos(theta))**(2 / SHAPE_POWER)
+    lateral = SAFETY_LAT * np.sign(np.sin(theta)) * np.abs(np.sin(theta))**(2 / SHAPE_POWER)
     for car in cars:
-        rect = patches.Rectangle((0, 0), car_length, car_width, color='white', zorder=3)
-        ax.add_patch(rect)
-        car_patches[car.id] = rect
-        
-        text = ax.text(0, 0, f"V{car.id}", color='black', weight='bold', fontsize=8,
-                       ha='center', va='center', zorder=4)
-        car_texts[car.id] = text
+        size = np.abs(car.forward) * 4.5 + np.abs(car.left) * 2.
+        body = patches.Rectangle((0, 0), *size, color=f'C{car.id - 1}', zorder=3)
+        contour, = ax.plot([], [], color=f'C{car.id - 1}', alpha=0.5)
+        ax.add_patch(body)
+        bodies.append(body)
+        contours.append(contour)
+        labels.append(ax.text(0, 0, f'V{car.id}', ha='center', va='center', zorder=4))
 
-    # Telemetry coordinates mapped exactly to top-left quadrant
-    time_text = ax.text(-40, 40, '', color='white', fontsize=14, fontfamily='monospace')
-    telem_text = ax.text(-40, 32, '', color='white', fontsize=10, fontfamily='monospace', va='top')
+    def update(frame):
+        ax.set_title(f'Superellipse MPC (power={SHAPE_POWER}) | t={frame * DT:.1f} s')
+        for car, body, label, contour in zip(cars, bodies, labels, contours):
+            visible = frame < len(car.xy_history)
+            for artist in (body, label, contour):
+                artist.set_visible(visible)
+            if visible:
+                xy = car.xy_history[frame]
+                body.set_xy(xy - np.array([body.get_width(), body.get_height()]) / 2)
+                label.set_position(xy)
+                outline = xy + longitudinal[:, None] * car.forward + lateral[:, None] * car.left
+                contour.set_data(outline[:, 0], outline[:, 1])
+        return bodies + labels + contours
 
-    # Fetch DT from the global scope of the file
-    global DT
-
-    def update(frame_idx):
-        current_time = frame_idx * DT
-        time_text.set_text(f"Simulation Time: {current_time:05.2f} s")
-        telem_lines = ["TELEMETRY:"]
-        
-        for car in sorted(cars, key=lambda c: c.id):
-            vid = car.id
-            approach = car.approach
-            
-            if frame_idx < len(car.position_history):
-                p = car.position_history[frame_idx]
-                v = car.speed_history[frame_idx]
-                state = car.state_history[frame_idx]
-            else:
-                state = "DONE"
-                p = car.position_history[-1] if car.position_history else 0
-                v = 0.0
-                
-            cx, cy = get_xy(approach, p)
-            rect = car_patches[vid]
-            
-            if state != "DONE":
-                telem_lines.append(f"V{vid}({approach}): {state:<8} | p={p:>5.1f} | v={v:>4.1f}")
-            
-            if state == "DONE" or cx < -45 or cx > 45 or cy < -45 or cy > 45:
-                rect.set_alpha(0.0)
-                car_texts[vid].set_alpha(0.0)
-            else:
-                rect.set_alpha(1.0)
-                car_texts[vid].set_alpha(1.0)
-                rect.set_facecolor(STATE_COLORS.get(state, "white"))
-                
-                if approach == "W":
-                    rect.set_width(car_length)
-                    rect.set_height(car_width)
-                    rect.set_xy((cx - car_length, cy - car_width/2))
-                    car_texts[vid].set_position((cx - car_length/2, cy))
-                elif approach == "E":
-                    rect.set_width(car_length)
-                    rect.set_height(car_width)
-                    rect.set_xy((cx, cy - car_width/2))
-                    car_texts[vid].set_position((cx + car_length/2, cy))
-                elif approach == "S":
-                    rect.set_width(car_width)
-                    rect.set_height(car_length)
-                    rect.set_xy((cx - car_width/2, cy - car_length))
-                    car_texts[vid].set_position((cx, cy - car_length/2))
-                elif approach == "N":
-                    rect.set_width(car_width)
-                    rect.set_height(car_length)
-                    rect.set_xy((cx - car_width/2, cy))
-                    car_texts[vid].set_position((cx, cy + car_length/2))
-
-        telem_text.set_text("\n".join(telem_lines))
-        return list(car_patches.values()) + list(car_texts.values()) + [time_text, telem_text]
-
-    ani = animation.FuncAnimation(fig, update, frames=max_frames, interval=200, blit=True)
-    plt.tight_layout()
+    ani = animation.FuncAnimation(fig, update, frames=max(len(c.time_history) for c in cars),
+                                  interval=DT * 1000, repeat=False)
     plt.show()
+    return ani
 
-# =============================================================================
-# 7. MAIN
-# =============================================================================
 
-if __name__ == "__main__":
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--no-animation', action='store_true')
+    parser.add_argument('--shape-power', type=int, choices=(2, 4), default=SHAPE_POWER,
+                        help='2: ellipse baseline; 4: superellipse experiment (default)')
+    args = parser.parse_args()
+    SHAPE_POWER = args.shape_power
     cars = run_simulation()
-    print_summary(cars)
     plot_results(cars)
-    animate_results(cars)
+    if not args.no_animation:
+        animate_results(cars)
