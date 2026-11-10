@@ -1,0 +1,4 @@
+scenario,cars_that_stopped,last_car_out_s,mean_delay_s,longest_stop_s,peak_accel_ms2,sum_a2_dt
+All-way stop, FIFO (with limits),4,18.2,7.8,8.2,3.0,188
+All-way stop, FIFO (no limits, slide 12),4,13.4,4.8,4.8,38.7,1310
+No mandatory stop (with limits),0,8.6,0.9,0.0,3.0,75
