@@ -1,0 +1,7 @@
+Cars: 8, completed: 8
+W_LANE: 100.0, W_LATERAL_SPEED: 80.0, seed: 7
+Obstacle overlap samples: 0
+Car overlap samples: 0
+Optimizer retry/failure events: 0
+Conflict-point occupancy events: 0
+Unfinished arrivals: 0
