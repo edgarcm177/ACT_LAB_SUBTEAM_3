@@ -1,0 +1,77 @@
+scenario,policy,release_s,vehicles,batch_size
+blocked_pair,fifo,7.2,1,1
+blocked_pair,fifo,11.4,2,1
+blocked_pair,fifo,15.600000000000001,3,1
+blocked_pair,fifo,19.8,4,1
+blocked_pair,fair,7.2,1,1
+blocked_pair,fair,11.4,2 4,2
+blocked_pair,fair,15.600000000000001,3,1
+simultaneous,fifo,8.0,1,1
+simultaneous,fifo,12.200000000000001,2,1
+simultaneous,fifo,16.400000000000002,3,1
+simultaneous,fifo,20.6,4,1
+simultaneous,fair,8.0,1 3,2
+simultaneous,fair,12.200000000000001,2 4,2
+staggered,fifo,7.6000000000000005,1,1
+staggered,fifo,11.8,2,1
+staggered,fifo,16.0,3 4,2
+staggered,fair,7.6000000000000005,1,1
+staggered,fair,11.8,3 4,2
+staggered,fair,16.0,2,1
+slow_approach,fifo,8.200000000000001,2,1
+slow_approach,fifo,12.4,1 3,2
+slow_approach,fifo,16.6,4,1
+slow_approach,fair,8.200000000000001,2,1
+slow_approach,fair,12.4,1 3,2
+slow_approach,fair,16.6,4,1
+seed_00,fifo,8.6,2,1
+seed_00,fifo,12.8,4,1
+seed_00,fifo,17.0,1 3,2
+seed_00,fair,8.6,2,1
+seed_00,fair,12.8,1 3,2
+seed_00,fair,17.0,4,1
+seed_01,fifo,7.6000000000000005,2,1
+seed_01,fifo,11.8,1 3,2
+seed_01,fifo,16.0,4,1
+seed_01,fair,7.6000000000000005,2,1
+seed_01,fair,11.8,1 3,2
+seed_01,fair,16.0,4,1
+seed_02,fifo,8.6,1,1
+seed_02,fifo,12.8,4,1
+seed_02,fifo,17.0,3,1
+seed_02,fifo,21.200000000000003,2,1
+seed_02,fair,8.6,1,1
+seed_02,fair,12.8,4 2,2
+seed_02,fair,17.0,3,1
+seed_03,fifo,8.200000000000001,3,1
+seed_03,fifo,12.4,1,1
+seed_03,fifo,16.6,4 2,2
+seed_03,fair,8.200000000000001,3,1
+seed_03,fair,12.4,4 2,2
+seed_03,fair,16.6,1,1
+seed_04,fifo,8.8,3,1
+seed_04,fifo,13.0,4,1
+seed_04,fifo,17.2,1,1
+seed_04,fifo,21.400000000000002,2,1
+seed_04,fair,8.8,3,1
+seed_04,fair,13.0,4 2,2
+seed_04,fair,17.2,1,1
+seed_05,fifo,8.200000000000001,3,1
+seed_05,fifo,12.4,2 4,2
+seed_05,fifo,16.6,1,1
+seed_05,fair,8.200000000000001,3,1
+seed_05,fair,12.4,2 4,2
+seed_05,fair,16.6,1,1
+seed_06,fifo,8.4,2,1
+seed_06,fifo,12.600000000000001,1,1
+seed_06,fifo,16.8,4,1
+seed_06,fifo,21.0,3,1
+seed_06,fair,8.4,2,1
+seed_06,fair,12.600000000000001,1 3,2
+seed_06,fair,16.8,4,1
+seed_07,fifo,7.4,4,1
+seed_07,fifo,11.600000000000001,3 1,2
+seed_07,fifo,15.8,2,1
+seed_07,fair,7.4,4,1
+seed_07,fair,11.600000000000001,3 1,2
+seed_07,fair,15.8,2,1
